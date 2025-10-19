@@ -1,0 +1,27 @@
+# Environment variables
+.env
+
+# Go build artifacts
+dwolla-transfer-server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test and coverage
+*.test
+*.out
+coverage.txt
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
