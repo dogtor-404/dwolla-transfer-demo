@@ -145,11 +145,18 @@ curl http://localhost:8001/api/dwolla/transfer/transfer-id
 
 ### Dwolla Service (Port 8001)
 
+**Core Endpoints**:
 - `GET /health` - Health check
 - `POST /api/dwolla/customer` - Create Dwolla customer
 - `POST /api/dwolla/funding-source` - Link bank account via Plaid
 - `POST /api/dwolla/transfer` - Initiate transfer
 - `GET /api/dwolla/transfer/:id` - Get transfer status
+
+**Webhook Endpoints**:
+- `POST /api/dwolla/webhook-subscription` - Create webhook subscription
+- `GET /api/dwolla/webhook-subscriptions` - List webhook subscriptions
+- `DELETE /api/dwolla/webhook-subscription/:id` - Delete webhook subscription
+- `POST /api/dwolla/webhook` - Receive webhook notifications (called by Dwolla)
 
 ## Implementation Details
 
@@ -193,11 +200,187 @@ DWOLLA_ENV=sandbox
 DWOLLA_BASE_URL=https://api-sandbox.dwolla.com
 PLAID_API_URL=http://localhost:8000
 APP_PORT=8001
+
+# Webhook Configuration (optional, for webhook testing)
+DWOLLA_WEBHOOK_SECRET=your_webhook_secret_here
+WEBHOOK_BASE_URL=https://your-ngrok-url.ngrok.io
+```
+
+See `env.example` for a complete template.
+
+## Webhook Integration
+
+### Overview
+
+Dwolla webhooks provide real-time notifications for events like transfer completion, eliminating the need to poll for status updates. This implementation includes:
+
+- ✅ Automatic webhook signature verification
+- ✅ Real-time event logging to console
+- ✅ Support for all Dwolla event types
+- ✅ ngrok integration for local testing
+
+### Setup Webhooks
+
+#### 1. Install ngrok
+
+**macOS**:
+```bash
+brew install ngrok/ngrok/ngrok
+```
+
+**Linux**:
+```bash
+snap install ngrok
+```
+
+**Windows**: Download from https://ngrok.com/download
+
+#### 2. Configure ngrok
+
+1. Sign up at https://dashboard.ngrok.com/signup
+2. Get your authtoken from https://dashboard.ngrok.com/get-started/your-authtoken
+3. Configure:
+```bash
+ngrok config add-authtoken YOUR_AUTHTOKEN
+```
+
+#### 3. Generate Webhook Secret
+
+Generate a secure random string for webhook verification:
+```bash
+openssl rand -base64 32
+```
+
+#### 4. Update .env File
+
+Add to your `dwolla-transfer-demo/.env`:
+```bash
+DWOLLA_WEBHOOK_SECRET=your_generated_secret_here
+WEBHOOK_BASE_URL=https://your-ngrok-url.ngrok.io
+```
+
+### Using Webhooks
+
+#### Start ngrok Tunnel
+
+In a separate terminal:
+```bash
+ngrok http 8001
+```
+
+Copy the HTTPS URL (e.g., `https://abc123.ngrok.io`) and update `WEBHOOK_BASE_URL` in your `.env` file.
+
+#### Register Webhook Subscription
+
+```bash
+curl -X POST http://localhost:8001/api/dwolla/webhook-subscription \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+The service will automatically use `WEBHOOK_BASE_URL` and `DWOLLA_WEBHOOK_SECRET` from your environment.
+
+Response:
+```json
+{
+  "subscription_url": "https://api-sandbox.dwolla.com/webhook-subscriptions/xxx",
+  "webhook_url": "https://abc123.ngrok.io/api/dwolla/webhook",
+  "status": "created"
+}
+```
+
+#### Monitor Webhooks
+
+When transfers or other events occur, you'll see real-time notifications in your Dwolla service console:
+
+```
+============================================================
+🔔 WEBHOOK RECEIVED at 2024-01-15 10:30:45
+============================================================
+Event ID:  abc-123-def
+Topic:     transfer_completed
+Timestamp: 2024-01-15T10:30:45.000Z
+Resource:  https://api-sandbox.dwolla.com/transfers/xxx
+✅ Transfer completed successfully!
+
+Full webhook payload:
+{
+  "id": "abc-123-def",
+  "topic": "transfer_completed",
+  "timestamp": "2024-01-15T10:30:45.000Z",
+  ...
+}
+============================================================
+```
+
+#### Supported Event Types
+
+The webhook handler recognizes and logs:
+- `transfer_completed` - ✅ Transfer successful
+- `transfer_failed` - ❌ Transfer failed
+- `transfer_cancelled` - ⚠ Transfer cancelled
+- `customer_created` - 👤 Customer created
+- `customer_funding_source_added` - 🏦 Funding source added
+- `customer_funding_source_verified` - ✓ Funding source verified
+- And many more...
+
+### List Active Webhooks
+
+```bash
+curl http://localhost:8001/api/dwolla/webhook-subscriptions
+```
+
+### Delete Webhook Subscription
+
+```bash
+curl -X DELETE http://localhost:8001/api/dwolla/webhook-subscription/SUBSCRIPTION_ID
 ```
 
 ## Testing
 
-### Automated Test Script
+### Automated Webhook Test
+
+Run the complete webhook integration test with automatic ngrok setup:
+```bash
+cd dwolla-transfer-demo
+./test_webhook.sh
+```
+
+This script will:
+1. ✅ Check if ngrok is installed
+2. ✅ Start ngrok tunnel automatically
+3. ✅ Register webhook subscription
+4. ✅ Create customers and funding sources
+5. ✅ Execute a transfer
+6. ✅ Wait for webhook notifications
+7. ✅ Clean up (delete subscription, stop ngrok)
+
+**Expected Output**:
+```
+========================================
+Dwolla Webhook Integration Test
+========================================
+
+1. Checking ngrok installation...
+   ✓ ngrok is installed
+
+2. Checking services...
+   ✓ Plaid service is running
+   ✓ Dwolla service is running
+
+3. Setting up ngrok tunnel...
+   ✓ ngrok public URL: https://abc123.ngrok.io
+
+4. Registering webhook subscription...
+   ✓ Webhook subscription created
+
+...
+
+✅ Integration verified with webhooks
+💡 Check server console for webhook notifications
+```
+
+### Automated Test Script (Without Webhooks)
 
 Run the complete integration test:
 ```bash
@@ -252,7 +435,9 @@ Plaid + Dwolla Integration Test
 - **Dwolla Customer Creation**: ✅ Tested successfully
 - **Bank Account Linking**: ✅ Auto-fetches processor_token from Plaid
 - **Service Communication**: ✅ Plaid ↔ Dwolla API calls working
-- **Automated Testing**: ✅ Complete test script available
+- **Transfer Execution**: ✅ Payout and Payin transfers working
+- **Webhook Integration**: ✅ Real-time notifications with signature verification
+- **Automated Testing**: ✅ Complete test scripts available (with and without webhooks)
 
 ### 🚀 Ready for Production
 
@@ -260,7 +445,7 @@ The integration is now ready for:
 - Real Dwolla transfers (with proper funding sources)
 - Production deployment
 - Frontend integration
-- Webhook handling
+- Real-time webhook notifications
 
 ## References
 
@@ -268,4 +453,6 @@ The integration is now ready for:
 - [Plaid Processor Token](https://plaid.com/docs/api/processors/)
 - [Dwolla API](https://developers.dwolla.com/api-reference)
 - [Dwolla + Plaid Integration](https://developers.dwolla.com/docs/open-banking/plaid)
+- [Dwolla Webhooks](https://developers.dwolla.com/docs/balance/webhooks)
 - [Enable Dwolla Integration in Plaid](https://dashboard.plaid.com/developers/integrations)
+- [ngrok Documentation](https://ngrok.com/docs)

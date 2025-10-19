@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,19 +12,22 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
 
 var (
-	DWOLLA_APP_KEY    = ""
-	DWOLLA_APP_SECRET = ""
-	DWOLLA_ENV        = ""
-	DWOLLA_BASE_URL   = ""
-	PLAID_API_URL     = ""
-	APP_PORT          = ""
-	dwollaToken       = ""
+	DWOLLA_APP_KEY        = ""
+	DWOLLA_APP_SECRET     = ""
+	DWOLLA_ENV            = ""
+	DWOLLA_BASE_URL       = ""
+	PLAID_API_URL         = ""
+	APP_PORT              = ""
+	DWOLLA_WEBHOOK_SECRET = ""
+	WEBHOOK_BASE_URL      = ""
+	dwollaToken           = ""
 )
 
 func init() {
@@ -38,6 +44,8 @@ func init() {
 	DWOLLA_BASE_URL = os.Getenv("DWOLLA_BASE_URL")
 	PLAID_API_URL = os.Getenv("PLAID_API_URL")
 	APP_PORT = os.Getenv("APP_PORT")
+	DWOLLA_WEBHOOK_SECRET = os.Getenv("DWOLLA_WEBHOOK_SECRET")
+	WEBHOOK_BASE_URL = os.Getenv("WEBHOOK_BASE_URL")
 
 	// Set defaults
 	if DWOLLA_ENV == "" {
@@ -90,6 +98,15 @@ func main() {
 	r.POST("/api/dwolla/funding-source", createFundingSource)
 	r.POST("/api/dwolla/transfer", createTransfer)
 	r.GET("/api/dwolla/transfer/:id", getTransfer)
+
+	// Webhook endpoints
+	r.POST("/api/dwolla/webhook-subscription", createWebhookSubscription)
+	r.GET("/api/dwolla/webhook-subscriptions", listWebhookSubscriptions)
+	r.DELETE("/api/dwolla/webhook-subscription/:id", deleteWebhookSubscription)
+	r.POST("/api/dwolla/webhook", handleWebhook)
+
+	// Sandbox simulation endpoints
+	r.POST("/api/dwolla/simulate-transfer", simulateTransfer)
 
 	fmt.Printf("Dwolla Transfer Demo server starting on port %s...\n", APP_PORT)
 	err := r.Run(":" + APP_PORT)
@@ -443,4 +460,274 @@ func getTransfer(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+// createWebhookSubscription creates or updates a webhook subscription
+// POST /api/dwolla/webhook-subscription
+func createWebhookSubscription(c *gin.Context) {
+	var reqBody struct {
+		URL    string `json:"url"`
+		Secret string `json:"secret"`
+	}
+
+	if err := c.BindJSON(&reqBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Use environment variables if not provided in request
+	webhookURL := reqBody.URL
+	if webhookURL == "" {
+		if WEBHOOK_BASE_URL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "webhook URL not provided and WEBHOOK_BASE_URL not set"})
+			return
+		}
+		webhookURL = WEBHOOK_BASE_URL + "/api/dwolla/webhook"
+	}
+
+	webhookSecret := reqBody.Secret
+	if webhookSecret == "" {
+		webhookSecret = DWOLLA_WEBHOOK_SECRET
+	}
+
+	if webhookSecret == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "webhook secret not provided and DWOLLA_WEBHOOK_SECRET not set"})
+		return
+	}
+
+	// Create webhook subscription payload
+	payload := map[string]interface{}{
+		"url":    webhookURL,
+		"secret": webhookSecret,
+	}
+
+	url := DWOLLA_BASE_URL + "/webhook-subscriptions"
+	result, status, err := makeDwollaRequest("POST", url, payload)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if status != http.StatusCreated {
+		c.JSON(status, gin.H{"error": "Failed to create webhook subscription", "details": result})
+		return
+	}
+
+	subscriptionURL := result["location"].(string)
+	fmt.Printf("✓ Created webhook subscription: %s\n", subscriptionURL)
+	fmt.Printf("  Webhook URL: %s\n", webhookURL)
+
+	c.JSON(http.StatusOK, gin.H{
+		"subscription_url": subscriptionURL,
+		"webhook_url":      webhookURL,
+		"status":           "created",
+	})
+}
+
+// listWebhookSubscriptions lists all webhook subscriptions
+// GET /api/dwolla/webhook-subscriptions
+func listWebhookSubscriptions(c *gin.Context) {
+	url := DWOLLA_BASE_URL + "/webhook-subscriptions"
+	result, status, err := makeDwollaRequest("GET", url, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if status != http.StatusOK {
+		c.JSON(status, gin.H{"error": "Failed to list webhook subscriptions", "details": result})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// deleteWebhookSubscription deletes a webhook subscription
+// DELETE /api/dwolla/webhook-subscription/:id
+func deleteWebhookSubscription(c *gin.Context) {
+	subscriptionID := c.Param("id")
+
+	url := DWOLLA_BASE_URL + "/webhook-subscriptions/" + subscriptionID
+	result, status, err := makeDwollaRequest("DELETE", url, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if status != http.StatusOK && status != http.StatusNoContent {
+		c.JSON(status, gin.H{"error": "Failed to delete webhook subscription", "details": result})
+		return
+	}
+
+	fmt.Printf("✓ Deleted webhook subscription: %s\n", subscriptionID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":          "deleted",
+		"subscription_id": subscriptionID,
+	})
+}
+
+// verifyWebhookSignature verifies the Dwolla webhook signature
+func verifyWebhookSignature(signature, payload, secret string) bool {
+	if secret == "" {
+		fmt.Println("⚠ Warning: DWOLLA_WEBHOOK_SECRET not set, skipping signature verification")
+		return true
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(payload))
+	expectedSignature := hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(signature), []byte(expectedSignature))
+}
+
+// handleWebhook receives and processes Dwolla webhook notifications
+// POST /api/dwolla/webhook
+func handleWebhook(c *gin.Context) {
+	// Read raw body for signature verification
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
+		return
+	}
+
+	// Get signature from header
+	signature := c.GetHeader("X-Request-Signature-SHA-256")
+
+	// Verify signature
+	if !verifyWebhookSignature(signature, string(bodyBytes), DWOLLA_WEBHOOK_SECRET) {
+		fmt.Printf("❌ Webhook signature verification failed\n")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid signature"})
+		return
+	}
+
+	// Parse webhook payload
+	var webhook map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &webhook); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+		return
+	}
+
+	// Extract webhook details
+	eventID, _ := webhook["id"].(string)
+	topic, _ := webhook["topic"].(string)
+	timestamp, _ := webhook["timestamp"].(string)
+
+	// Log webhook event
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Printf("🔔 WEBHOOK RECEIVED at %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("Event ID:  %s\n", eventID)
+	fmt.Printf("Topic:     %s\n", topic)
+	fmt.Printf("Timestamp: %s\n", timestamp)
+
+	// Extract resource links
+	if links, ok := webhook["_links"].(map[string]interface{}); ok {
+		if resource, ok := links["resource"].(map[string]interface{}); ok {
+			if resourceHref, ok := resource["href"].(string); ok {
+				fmt.Printf("Resource:  %s\n", resourceHref)
+			}
+		}
+	}
+
+	// Handle specific event types
+	switch topic {
+	case "transfer_completed":
+		fmt.Println("✅ Transfer completed successfully!")
+	case "transfer_failed":
+		fmt.Println("❌ Transfer failed!")
+	case "transfer_cancelled":
+		fmt.Println("⚠ Transfer cancelled!")
+	case "customer_created":
+		fmt.Println("👤 Customer created")
+	case "customer_funding_source_added":
+		fmt.Println("🏦 Funding source added")
+	case "customer_funding_source_verified":
+		fmt.Println("✓ Funding source verified")
+	default:
+		fmt.Printf("ℹ Event: %s\n", topic)
+	}
+
+	// Print full webhook payload for debugging
+	fmt.Println("\nFull webhook payload:")
+	prettyJSON, _ := json.MarshalIndent(webhook, "", "  ")
+	fmt.Println(string(prettyJSON))
+	fmt.Println(strings.Repeat("=", 60))
+
+	// Respond with 200 OK to acknowledge receipt
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "received",
+		"event_id": eventID,
+		"topic":    topic,
+	})
+}
+
+// simulateTransfer simulates transfer processing in sandbox environment
+// POST /api/dwolla/simulate-transfer
+func simulateTransfer(c *gin.Context) {
+	var reqBody struct {
+		TransferURL string `json:"transfer_url" binding:"required"`
+		Action      string `json:"action"` // "process" (complete) or "fail"
+	}
+
+	if err := c.BindJSON(&reqBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Set default action to process (complete the transfer)
+	action := reqBody.Action
+	if action == "" {
+		action = "process"
+	}
+
+	// Validate action
+	if action != "process" && action != "fail" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "action must be 'process' or 'fail'"})
+		return
+	}
+
+	// Create simulation payload
+	payload := map[string]interface{}{
+		"_links": map[string]interface{}{
+			"transfer": map[string]string{
+				"href": reqBody.TransferURL,
+			},
+		},
+	}
+
+	// For process action, simulate processing
+	if action == "process" {
+		// Process the transfer to completion
+	} else if action == "fail" {
+		// Add failure code for failed transfers
+		payload["failureCode"] = "R01" // Insufficient Funds
+	}
+
+	url := DWOLLA_BASE_URL + "/sandbox-simulations"
+	result, status, err := makeDwollaRequest("POST", url, payload)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if status != http.StatusCreated && status != http.StatusOK {
+		c.JSON(status, gin.H{"error": "Failed to simulate transfer", "details": result})
+		return
+	}
+
+	actionMsg := "completed"
+	if action == "fail" {
+		actionMsg = "failed"
+	}
+
+	fmt.Printf("✓ Simulated transfer %s: %s\n", actionMsg, reqBody.TransferURL)
+	fmt.Printf("  💡 Check webhook logs for transfer_%s event\n", actionMsg)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":       "simulated",
+		"action":       action,
+		"transfer_url": reqBody.TransferURL,
+		"message":      fmt.Sprintf("Transfer simulation initiated. Webhook should trigger transfer_%s event.", actionMsg),
+	})
 }
