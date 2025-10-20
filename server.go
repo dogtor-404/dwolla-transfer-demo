@@ -29,6 +29,8 @@ var (
 	DWOLLA_WEBHOOK_SECRET = ""
 	WEBHOOK_BASE_URL      = ""
 	dwollaToken           = ""
+	dwollaTokenExpiresAt  time.Time
+	tokenMutex            sync.RWMutex
 
 	// Webhook events storage
 	webhookEvents []map[string]interface{}
@@ -76,12 +78,35 @@ func init() {
 	fmt.Printf("Plaid API URL: %s\n", PLAID_API_URL)
 
 	// Get Dwolla access token
-	token, err := getDwollaToken()
-	if err != nil {
+	if err := refreshDwollaToken(); err != nil {
 		log.Fatal("Failed to get Dwolla access token:", err)
 	}
-	dwollaToken = token
 	fmt.Printf("Dwolla token obtained successfully\n")
+
+	// Start background token refresh worker
+	go tokenRefreshWorker()
+}
+
+// tokenRefreshWorker automatically refreshes the token before expiration
+func tokenRefreshWorker() {
+	ticker := time.NewTicker(10 * time.Minute) // Check every 10 minutes
+	defer ticker.Stop()
+
+	for range ticker.C {
+		tokenMutex.RLock()
+		timeUntilExpiry := time.Until(dwollaTokenExpiresAt)
+		tokenMutex.RUnlock()
+
+		// Refresh if token expires in less than 5 minutes
+		if timeUntilExpiry < 5*time.Minute {
+			fmt.Printf("🔄 Token expiring soon (in %v), refreshing...\n", timeUntilExpiry)
+			if err := refreshDwollaToken(); err != nil {
+				log.Printf("❌ Failed to refresh token: %v\n", err)
+			} else {
+				fmt.Printf("✅ Token refreshed successfully\n")
+			}
+		}
+	}
 }
 
 func main() {
@@ -121,8 +146,8 @@ func main() {
 	}
 }
 
-// getDwollaToken gets an OAuth access token from Dwolla
-func getDwollaToken() (string, error) {
+// refreshDwollaToken gets a new OAuth access token from Dwolla
+func refreshDwollaToken() error {
 	authURL := DWOLLA_BASE_URL + "/token"
 
 	// Create request body
@@ -130,7 +155,7 @@ func getDwollaToken() (string, error) {
 
 	req, err := http.NewRequest("POST", authURL, strings.NewReader(data))
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	// Set headers
@@ -138,16 +163,16 @@ func getDwollaToken() (string, error) {
 	req.SetBasicAuth(DWOLLA_APP_KEY, DWOLLA_APP_SECRET)
 
 	// Make request
-	client := &http.Client{}
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to get token, status: %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to get token, status: %d, body: %s", resp.StatusCode, string(body))
 	}
 
 	// Parse response
@@ -157,14 +182,40 @@ func getDwollaToken() (string, error) {
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return err
 	}
 
-	return result.AccessToken, nil
+	// Update token with lock
+	tokenMutex.Lock()
+	dwollaToken = result.AccessToken
+	dwollaTokenExpiresAt = time.Now().Add(time.Duration(result.ExpiresIn) * time.Second)
+	tokenMutex.Unlock()
+
+	fmt.Printf("Token will expire at: %s (%d seconds)\n",
+		dwollaTokenExpiresAt.Format("2006-01-02 15:04:05"), result.ExpiresIn)
+
+	return nil
 }
 
-// makeDwollaRequest makes an authenticated request to Dwolla API
+// getDwollaToken returns the current token (kept for backward compatibility)
+func getDwollaToken() (string, error) {
+	tokenMutex.RLock()
+	defer tokenMutex.RUnlock()
+
+	if dwollaToken == "" {
+		return "", fmt.Errorf("token not initialized")
+	}
+
+	return dwollaToken, nil
+}
+
+// makeDwollaRequest makes an authenticated request to Dwolla API with automatic retry on 401
 func makeDwollaRequest(method, url string, body interface{}) (map[string]interface{}, int, error) {
+	return makeDwollaRequestWithRetry(method, url, body, true)
+}
+
+// makeDwollaRequestWithRetry makes an authenticated request with optional retry
+func makeDwollaRequestWithRetry(method, url string, body interface{}, allowRetry bool) (map[string]interface{}, int, error) {
 	var reqBody io.Reader
 	if body != nil {
 		jsonData, err := json.Marshal(body)
@@ -179,11 +230,16 @@ func makeDwollaRequest(method, url string, body interface{}) (map[string]interfa
 		return nil, 0, err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+dwollaToken)
+	// Get token with read lock
+	tokenMutex.RLock()
+	token := dwollaToken
+	tokenMutex.RUnlock()
+
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/vnd.dwolla.v1.hal+json")
 	req.Header.Set("Accept", "application/vnd.dwolla.v1.hal+json")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -193,6 +249,16 @@ func makeDwollaRequest(method, url string, body interface{}) (map[string]interfa
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, resp.StatusCode, err
+	}
+
+	// Handle 401 Unauthorized - token might be expired
+	if resp.StatusCode == http.StatusUnauthorized && allowRetry {
+		fmt.Printf("⚠️  Got 401 Unauthorized, refreshing token and retrying...\n")
+		if err := refreshDwollaToken(); err != nil {
+			return nil, resp.StatusCode, fmt.Errorf("token refresh failed: %w", err)
+		}
+		// Retry once with new token (allowRetry = false to prevent infinite loop)
+		return makeDwollaRequestWithRetry(method, url, body, false)
 	}
 
 	var result map[string]interface{}

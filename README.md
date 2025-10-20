@@ -223,15 +223,85 @@ Resource:  https://api-sandbox.dwolla.com/transfers/xxx
 ============================================================
 ```
 
+## 🔐 OAuth Token Management
+
+### Automatic Token Refresh Strategy
+
+The service implements a **dual-layer protection** mechanism to ensure Dwolla OAuth tokens remain valid:
+
+#### 1. Proactive Refresh (Background Worker)
+- Checks token expiration every **10 minutes**
+- Automatically refreshes token when less than **5 minutes** remaining
+- Runs in background goroutine without blocking requests
+- Token typically expires in **1 hour (3600 seconds)**
+
+#### 2. Reactive Refresh (401 Retry)
+- Intercepts `401 Unauthorized` responses
+- Immediately refreshes token and retries the request
+- Prevents request failures due to race conditions
+- Single retry to prevent infinite loops
+
+### Implementation Details
+
+```go
+// Token lifecycle management
+var (
+    dwollaToken          string      // Current OAuth token
+    dwollaTokenExpiresAt time.Time   // Expiration timestamp
+    tokenMutex           sync.RWMutex // Thread-safe access
+)
+
+// Background worker checks every 10 minutes
+func tokenRefreshWorker() {
+    ticker := time.NewTicker(10 * time.Minute)
+    for range ticker.C {
+        if time.Until(dwollaTokenExpiresAt) < 5*time.Minute {
+            refreshDwollaToken()
+        }
+    }
+}
+
+// All API requests use thread-safe token access
+func makeDwollaRequest() {
+    tokenMutex.RLock()
+    token := dwollaToken
+    tokenMutex.RUnlock()
+    // Use token for API request...
+}
+```
+
+### Benefits for Long-Running Services
+
+This design is ideal for services running in **Temporal workflows** or other scheduled background jobs:
+
+✅ **No manual intervention** - Tokens refresh automatically  
+✅ **Zero downtime** - Service can run indefinitely  
+✅ **Thread-safe** - Handles concurrent requests safely  
+✅ **Resilient** - Automatic recovery from token expiration  
+✅ **Temporal-friendly** - Perfect for scheduled repayment workflows
+
+### Token Refresh Logs
+
+```
+Token will expire at: 2024-10-20 15:30:45 (3600 seconds)
+🔄 Token expiring soon (in 4m30s), refreshing...
+✅ Token refreshed successfully
+```
+
 ## 🛠️ Troubleshooting
 
 ### Common Issues
 
 #### 1. "Invalid access token" Error
+**Note**: With automatic token refresh, this should rarely occur. The service automatically handles token expiration.
+
+If you still see this error:
 ```bash
-# Restart Dwolla service to get new token
-lsof -ti :8001 | xargs kill -9
-./dwolla-server
+# Check service logs for token refresh status
+tail -f dwolla-server.log | grep -E "Token|401"
+
+# Service will auto-retry with new token
+# Look for: "⚠️ Got 401 Unauthorized, refreshing token and retrying..."
 ```
 
 #### 2. ngrok 502 Bad Gateway
@@ -278,17 +348,20 @@ tail -f dwolla-server.log | grep "WEBHOOK RECEIVED"
 
 ### ✅ Implemented Features
 - **Complete Webhook Integration** - Real-time notifications for all Dwolla events
+- **Automatic Token Refresh** - Background worker + 401 retry for seamless token management
 - **Sandbox Simulation** - Test transfer completion/failure scenarios
 - **Automated Testing** - One-command end-to-end testing
 - **Signature Verification** - HMAC-SHA256 webhook security
 - **Comprehensive Logging** - Detailed event tracking with emojis
-- **Production Ready** - All code ready for production deployment
+- **Production Ready** - All code ready for production deployment including long-running services
 
 ### 🔧 Technical Highlights
 - **Dual Service Architecture** - Clean separation of Plaid and Dwolla concerns
 - **Automatic Token Management** - Seamless processor token fetching
-- **Error Handling** - Robust error handling and user feedback
+- **OAuth Token Auto-Refresh** - Background worker refreshes expired tokens automatically
+- **Error Handling** - Robust error handling and user feedback with 401 retry logic
 - **Environment Flexibility** - Easy switching between sandbox and production
+- **Thread-Safe Operations** - Mutex-protected token access for concurrent requests
 
 ## 📖 Reference Resources
 
