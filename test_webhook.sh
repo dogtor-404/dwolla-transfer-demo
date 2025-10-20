@@ -332,8 +332,34 @@ done
 echo ""
 echo ""
 
+# Check for webhook logs in the service output
+echo "16. Checking for webhook events..."
+echo "    💡 Looking for transfer_completed webhook in service logs..."
+echo ""
+
+# Try to get recent webhook events from the service
+WEBHOOK_EVENTS=$(curl -s "${DWOLLA_URL}/api/dwolla/webhook-events" 2>/dev/null || echo "[]")
+
+if [ "$WEBHOOK_EVENTS" != "[]" ] && [ -n "$WEBHOOK_EVENTS" ]; then
+    echo "   📡 Recent webhook events:"
+    echo "$WEBHOOK_EVENTS" | jq -r '.[] | "   - \(.topic) at \(.timestamp)"' 2>/dev/null || echo "   (Raw events: $WEBHOOK_EVENTS)"
+    
+    # Check specifically for transfer_completed
+    TRANSFER_COMPLETED=$(echo "$WEBHOOK_EVENTS" | jq -r '.[] | select(.topic == "transfer_completed")' 2>/dev/null)
+    if [ -n "$TRANSFER_COMPLETED" ] && [ "$TRANSFER_COMPLETED" != "null" ]; then
+        echo ""
+        echo "   🎉 TRANSFER_COMPLETED webhook found!"
+        echo "   Full webhook payload:"
+        echo "$TRANSFER_COMPLETED" | jq '.' 2>/dev/null || echo "$TRANSFER_COMPLETED"
+    fi
+else
+    echo "   💡 Webhook events are logged in the Dwolla service console"
+    echo "   Look for: 🔔 WEBHOOK RECEIVED"
+fi
+echo ""
+
 # Check final transfer status
-echo "16. Checking final transfer status..."
+echo "17. Checking final transfer status..."
 FINAL_STATUS_RESPONSE=$(curl -s "${DWOLLA_URL}/api/dwolla/transfer/${TRANSFER_ID}")
 
 if echo "$FINAL_STATUS_RESPONSE" | jq -e '.status' > /dev/null 2>&1; then

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +29,10 @@ var (
 	DWOLLA_WEBHOOK_SECRET = ""
 	WEBHOOK_BASE_URL      = ""
 	dwollaToken           = ""
+
+	// Webhook events storage
+	webhookEvents []map[string]interface{}
+	webhookMutex  sync.RWMutex
 )
 
 func init() {
@@ -104,6 +109,7 @@ func main() {
 	r.GET("/api/dwolla/webhook-subscriptions", listWebhookSubscriptions)
 	r.DELETE("/api/dwolla/webhook-subscription/:id", deleteWebhookSubscription)
 	r.POST("/api/dwolla/webhook", handleWebhook)
+	r.GET("/api/dwolla/webhook-events", getWebhookEvents)
 
 	// Sandbox simulation endpoints
 	r.POST("/api/dwolla/simulate-transfer", simulateTransfer)
@@ -613,6 +619,15 @@ func handleWebhook(c *gin.Context) {
 	topic, _ := webhook["topic"].(string)
 	timestamp, _ := webhook["timestamp"].(string)
 
+	// Store webhook event
+	webhookMutex.Lock()
+	webhookEvents = append(webhookEvents, webhook)
+	// Keep only last 50 events to prevent memory issues
+	if len(webhookEvents) > 50 {
+		webhookEvents = webhookEvents[len(webhookEvents)-50:]
+	}
+	webhookMutex.Unlock()
+
 	// Log webhook event
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Printf("🔔 WEBHOOK RECEIVED at %s\n", time.Now().Format("2006-01-02 15:04:05"))
@@ -730,4 +745,17 @@ func simulateTransfer(c *gin.Context) {
 		"transfer_url": reqBody.TransferURL,
 		"message":      fmt.Sprintf("Transfer simulation initiated. Webhook should trigger transfer_%s event.", actionMsg),
 	})
+}
+
+// getWebhookEvents returns the list of received webhook events
+// GET /api/dwolla/webhook-events
+func getWebhookEvents(c *gin.Context) {
+	webhookMutex.RLock()
+	defer webhookMutex.RUnlock()
+	
+	// Return a copy of the events
+	events := make([]map[string]interface{}, len(webhookEvents))
+	copy(events, webhookEvents)
+	
+	c.JSON(http.StatusOK, events)
 }

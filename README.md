@@ -7,15 +7,15 @@ Complete Plaid + Dwolla bank transfer integration with real-time webhook notific
 
 ### Two-Service Design
 ```
-┌─────────────────┐    ┌─────────────────┐
-│  Plaid Service  │    │ Dwolla Service  │
-│   Port 8000     │    │   Port 8001     │
-│                 │    │                 │
-│ • Bank Accounts │───▶│ • Create Customer│
-│ • Generate Tokens│    │ • Link Accounts │
+┌──────────────────┐    ┌────────────────────┐
+│  Plaid Service   │    │ Dwolla Service     │
+│   Port 8000      │    │   Port 8001        │
+│                  │    │                    │
+│ • Bank Accounts  │───▶│ • Create Customer  │
+│ • Generate Tokens│    │ • Link Accounts    │
 │ • Sandbox Support│    │ • Execute Transfers│
-└─────────────────┘    │ • Webhook Handler│
-                       └─────────────────┘
+└──────────────────┘    │ • Webhook Handler  │
+                        └────────────────────┘
 ```
 
 ## 🚀 Quick Start
@@ -192,6 +192,7 @@ curl -X POST http://localhost:8001/api/dwolla/simulate-transfer \
 - `GET /api/dwolla/webhook-subscriptions` - List subscriptions
 - `DELETE /api/dwolla/webhook-subscription/:id` - Delete subscription
 - `POST /api/dwolla/webhook` - Receive webhook notifications
+- `GET /api/dwolla/webhook-events` - Get received webhook events
 
 #### Sandbox Simulation
 - `POST /api/dwolla/simulate-transfer` - Simulate transfer processing
@@ -252,6 +253,9 @@ curl http://localhost:8001/health  # Dwolla
 
 # View webhook subscriptions
 curl http://localhost:8001/api/dwolla/webhook-subscriptions
+
+# View received webhook events
+curl http://localhost:8001/api/dwolla/webhook-events
 
 # Monitor webhook logs
 tail -f dwolla-server.log | grep "WEBHOOK RECEIVED"
