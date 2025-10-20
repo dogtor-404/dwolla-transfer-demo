@@ -752,10 +752,10 @@ func simulateTransfer(c *gin.Context) {
 func getWebhookEvents(c *gin.Context) {
 	webhookMutex.RLock()
 	defer webhookMutex.RUnlock()
-	
+
 	// Return a copy of the events
 	events := make([]map[string]interface{}, len(webhookEvents))
 	copy(events, webhookEvents)
-	
+
 	c.JSON(http.StatusOK, events)
 }

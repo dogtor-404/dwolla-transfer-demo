@@ -344,13 +344,27 @@ if [ "$WEBHOOK_EVENTS" != "[]" ] && [ -n "$WEBHOOK_EVENTS" ]; then
     echo "   📡 Recent webhook events:"
     echo "$WEBHOOK_EVENTS" | jq -r '.[] | "   - \(.topic) at \(.timestamp)"' 2>/dev/null || echo "   (Raw events: $WEBHOOK_EVENTS)"
     
-    # Check specifically for transfer_completed
-    TRANSFER_COMPLETED=$(echo "$WEBHOOK_EVENTS" | jq -r '.[] | select(.topic == "transfer_completed")' 2>/dev/null)
+    # Check specifically for transfer_completed (get the latest one)
+    TRANSFER_COMPLETED=$(echo "$WEBHOOK_EVENTS" | jq -r '.[] | select(.topic == "transfer_completed") | select(.resourceId == "'$TRANSFER_ID'")' 2>/dev/null)
     if [ -n "$TRANSFER_COMPLETED" ] && [ "$TRANSFER_COMPLETED" != "null" ]; then
         echo ""
         echo "   🎉 TRANSFER_COMPLETED webhook found!"
         echo "   Full webhook payload:"
         echo "$TRANSFER_COMPLETED" | jq '.' 2>/dev/null || echo "$TRANSFER_COMPLETED"
+        
+        # Verify transfer ID matches (get the first match)
+        WEBHOOK_TRANSFER_ID=$(echo "$TRANSFER_COMPLETED" | jq -r '.resourceId' 2>/dev/null | head -1)
+        if [ "$WEBHOOK_TRANSFER_ID" = "$TRANSFER_ID" ]; then
+            echo ""
+            echo "   ✅ Transfer ID verification: MATCH"
+            echo "   Webhook resourceId: $WEBHOOK_TRANSFER_ID"
+            echo "   Created transfer ID: $TRANSFER_ID"
+        else
+            echo ""
+            echo "   ❌ Transfer ID verification: MISMATCH"
+            echo "   Webhook resourceId: $WEBHOOK_TRANSFER_ID"
+            echo "   Created transfer ID: $TRANSFER_ID"
+        fi
     fi
 else
     echo "   💡 Webhook events are logged in the Dwolla service console"
@@ -366,6 +380,47 @@ if echo "$FINAL_STATUS_RESPONSE" | jq -e '.status' > /dev/null 2>&1; then
     FINAL_STATUS=$(echo "$FINAL_STATUS_RESPONSE" | jq -r '.status')
     FINAL_AMOUNT=$(echo "$FINAL_STATUS_RESPONSE" | jq -r '.amount.value')
     echo "   ✓ Final transfer status: $FINAL_STATUS ($FINAL_AMOUNT USD)"
+    
+    # Complete transfer verification
+    echo ""
+    echo "18. Complete transfer verification..."
+    echo "   🔍 Verifying transfer integrity:"
+    
+    # Check if webhook and API status match
+    if [ "$FINAL_STATUS" = "processed" ]; then
+        echo "   ✅ API Status: $FINAL_STATUS (Success)"
+    else
+        echo "   ❌ API Status: $FINAL_STATUS (Unexpected)"
+    fi
+    
+    # Check amount
+    if [ "$FINAL_AMOUNT" = "10.00" ]; then
+        echo "   ✅ Amount: $FINAL_AMOUNT USD (Correct)"
+    else
+        echo "   ❌ Amount: $FINAL_AMOUNT USD (Expected: 10.00)"
+    fi
+    
+    # Check if we have transfer_completed webhook
+    if [ -n "$TRANSFER_COMPLETED" ] && [ "$TRANSFER_COMPLETED" != "null" ]; then
+        echo "   ✅ Webhook: transfer_completed received"
+        
+        # Check ID match if we have the data
+        if [ -n "$WEBHOOK_TRANSFER_ID" ] && [ "$WEBHOOK_TRANSFER_ID" = "$TRANSFER_ID" ]; then
+            echo "   ✅ ID Match: Webhook resourceId matches transfer ID"
+        else
+            echo "   ❌ ID Match: Webhook resourceId does not match transfer ID"
+        fi
+    else
+        echo "   ❌ Webhook: transfer_completed NOT received"
+    fi
+    
+    echo ""
+    echo "   🎯 Transfer Verification Summary:"
+    if [ "$FINAL_STATUS" = "processed" ] && [ "$FINAL_AMOUNT" = "10.00" ] && [ -n "$TRANSFER_COMPLETED" ]; then
+        echo "   ✅ ALL VERIFICATIONS PASSED - Transfer is 100% correct!"
+    else
+        echo "   ⚠ Some verifications failed - Check details above"
+    fi
 else
     echo "   ⚠ Could not verify final status"
 fi
